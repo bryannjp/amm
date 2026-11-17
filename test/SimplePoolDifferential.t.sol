@@ -15,9 +15,12 @@ interface IUniswapV2PairLike {
     function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 timestamp);
     function totalSupply() external view returns (uint256);
     function transfer(address to, uint256 value) external returns (bool);
+    function price0CumulativeLast() external view returns (uint256);
+    function price1CumulativeLast() external view returns (uint256);
 }
 
-/// Runs the same operations on SimplePool and on the real Uniswap V2 pair and requires identical results.
+/// Runs the same operations on SimplePool and on the real Uniswap V2 pair and requires identical results,
+/// including the TWAP price accumulators (with random waits between steps).
 /// Uniswap uses the "push" model (send tokens, then call), so each step is replayed that way on the pair.
 contract SimplePoolDifferentialTest is Test {
     MockERC20 internal a0; // SimplePool's tokens
@@ -53,6 +56,8 @@ contract SimplePoolDifferentialTest is Test {
         assertEq(pool.reserve0(), r0, "reserve0");
         assertEq(pool.reserve1(), r1, "reserve1");
         assertEq(pool.totalSupply(), uni.totalSupply(), "LP supply");
+        assertEq(pool.price0CumulativeLast(), uni.price0CumulativeLast(), "price0Cumulative");
+        assertEq(pool.price1CumulativeLast(), uni.price1CumulativeLast(), "price1Cumulative");
     }
 
     function _seed(uint256 x, uint256 y) internal {
@@ -78,6 +83,7 @@ contract SimplePoolDifferentialTest is Test {
         for (uint256 i = 0; i < ops.length; i++) {
             uint256 amount = bound(amounts[i], 1, 1e26);
             uint256 op = ops[i] % 4;
+            vm.warp(block.timestamp + amount % 3_601); // 0-60 minutes between steps, sometimes the same second
             if (op <= 1) {
                 bool zeroForOne = op == 0;
                 try pool.swap(zeroForOne ? address(a0) : address(a1), amount, 0, block.timestamp) returns (
