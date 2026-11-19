@@ -5,6 +5,19 @@ import {Test} from "forge-std/Test.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SimplePool} from "../src/SimplePool.sol";
 import {SimpleTwapOracle} from "../src/SimpleTwapOracle.sol";
+import {IERC3156FlashBorrower} from "@openzeppelin/contracts/interfaces/IERC3156FlashBorrower.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+
+/// v3: a well-behaved borrower that always repays loan + fee.
+contract RepayingBorrower is IERC3156FlashBorrower {
+    function onFlashLoan(address, address token, uint256 amount, uint256 fee, bytes calldata)
+        external
+        returns (bytes32)
+    {
+        IERC20(token).approve(msg.sender, amount + fee);
+        return keccak256("ERC3156FlashBorrower.onFlashLoan");
+    }
+}
 import {MockERC20} from "./mocks/MockERC20.sol";
 
 /// Random sequences of adds, removes, swaps and direct donations. Calls that revert are simply undone.
@@ -28,6 +41,11 @@ contract PoolHandler is Test {
     bool public ghostTwapOutsideRange; // an average fell outside the lowest..highest price that held
     bool public ghostAccumulatorWentBack; // a running total decreased (no wrap is possible in these runs)
     uint256 public updates;
+
+    // v3: flash loans
+    RepayingBorrower public borrower;
+    bool public ghostFlashLoanWrongReserveChange; // a reserve moved by anything other than exactly the fee
+    uint256 public flashLoans;
 
     constructor(SimplePool p, MockERC20 a, MockERC20 b, address[] memory ac) {
         pool = p;
@@ -61,6 +79,24 @@ contract PoolHandler is Test {
         uint256 c1 = pool.price1CumulativeLast();
         _;
         if (pool.price0CumulativeLast() < c0 || pool.price1CumulativeLast() < c1) ghostAccumulatorWentBack = true;
+    }
+
+    function flashLoan(uint256 amount, bool zero) external tracked {
+        if (address(borrower) == address(0)) {
+            borrower = new RepayingBorrower();
+            t0.mint(address(borrower), 1e30);
+            t1.mint(address(borrower), 1e30);
+        }
+        address token = zero ? address(t0) : address(t1);
+        amount = bound(amount, 1, pool.maxFlashLoan(token));
+        uint256 r0 = pool.reserve0();
+        uint256 r1 = pool.reserve1();
+        uint256 fee = pool.flashFee(token, amount);
+        pool.flashLoan(borrower, token, amount, "");
+        uint256 expected0 = zero ? r0 + fee : r0;
+        uint256 expected1 = zero ? r1 : r1 + fee;
+        if (pool.reserve0() != expected0 || pool.reserve1() != expected1) ghostFlashLoanWrongReserveChange = true;
+        flashLoans++;
     }
 
     function wait(uint256 secs) external {
@@ -163,6 +199,11 @@ contract SimplePoolInvariantTest is Test {
 
     function invariant_RunningTotalsNeverGoBack() public view {
         assertFalse(h.ghostAccumulatorWentBack());
+    }
+
+    /// v3: a flash loan changes the reserves by exactly its fee (and never lowers them).
+    function invariant_FlashLoansOnlyAddTheirFee() public view {
+        assertFalse(h.ghostFlashLoanWrongReserveChange());
     }
 
     function invariant_KNeverDropsOnSwap() public view {
