@@ -10,6 +10,10 @@ v2 adds:
 - `SimpleTwapOracle`: reads the pool and gives the 30-minute time-weighted average price (TWAP)
 - Reserves capped at 2^112 so the accumulators can never overflow
 
+v3 adds:
+- ERC-3156 flash loans: borrow either token with no collateral, repaid with a 0.3% fee in the same transaction
+- The fee goes to the reserves, so LPs earn it like swap fees
+
 ## Design decisions
 - First deposit gets √(x·y) − 1,000 shares; the 1,000 are locked forever (inflation-attack defence)
 - Later deposits only take the amounts matching the current ratio
@@ -19,12 +23,15 @@ v2 adds:
 - Not supported: fee-on-transfer tokens; tokens sent directly to the pool are not counted (no skim/sync)
 - Spot prices can be moved inside one transaction; the TWAP ignores same-transaction manipulation and makes longer manipulation expensive
 - Limitations: the TWAP lags real price moves, and someone (a keeper bot) must call `update()` every 30 minutes
+- The borrower's callback must return the ERC-3156 magic value, so nobody can be made to pay fees for a loan they did not start
+- The borrower receives the real initiator (`msg.sender`), so standard borrowers can reject loans they did not start
+- All actions are blocked during a loan (`nonReentrant`); reserves stay unchanged until the loan is repaid
 
 ## Testing
-- 69 unit tests, incl. equal reserves, reentrancy, stale-reserve checks and oracle edge cases (same-second reads, 2^256 wrap-around)
+- 96 unit tests, incl. a full flash-loan liquidation, victims who approved the pool, and oracle edge cases
 - Differential fuzz tests against the real Uniswap V2 pair: identical shares, payouts, reserves and price accumulators
-- 7 invariants, incl. "the TWAP always lies between the lowest and highest price that held"
-- Mutation testing: 90/90 mutants killed
+- 8 invariants, incl. "a flash loan changes the reserves by exactly its fee"
+- Mutation testing: 112/112 mutants killed
 - 100% line and branch coverage
 
 ## Run it
