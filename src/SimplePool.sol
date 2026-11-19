@@ -6,11 +6,15 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
+import {IERC3156FlashBorrower} from "@openzeppelin/contracts/interfaces/IERC3156FlashBorrower.sol";
+import {IERC3156FlashLender} from "@openzeppelin/contracts/interfaces/IERC3156FlashLender.sol";
 
-contract SimplePool is ERC20, ReentrancyGuard {
+contract SimplePool is ERC20, ReentrancyGuard, IERC3156FlashLender {
     uint256 public constant MINIMUM_LIQUIDITY = 1_000;
     address public constant DEAD = address(0xdead);
     uint256 public constant Q112 = 2 ** 112;
+    uint256 public constant FLASH_FEE_BPS = 30;
+    bytes32 public constant CALLBACK_SUCCESS = keccak256("ERC3156FlashBorrower.onFlashLoan");
 
     IERC20 public immutable token0;
     IERC20 public immutable token1;
@@ -23,6 +27,9 @@ contract SimplePool is ERC20, ReentrancyGuard {
     event LiquidityAdded(address indexed provider, uint256 amount0, uint256 amount1, uint256 mintedShares);
     event LiquidityRemoved(address indexed taker, uint256 amount0, uint256 amount1, uint256 burnedShares);
     event Swap(address indexed trader, address indexed tokenIn, uint256 amountIn, uint256 amountOut);
+    event FlashLoan(
+        address indexed initiator, address indexed receiver, address indexed token, uint256 amount, uint256 fee
+    );
 
     error Pool__ZeroAddress();
     error Pool__IdenticalTokens();
@@ -32,6 +39,8 @@ contract SimplePool is ERC20, ReentrancyGuard {
     error Pool__Expired(uint256 timeDeadline);
     error Pool__InvalidToken(address token);
     error Pool__ReserveOverflow();
+    error Pool__FlashLoanTooLarge(uint256 amount, uint256 max);
+    error Pool__CallbackFailed();
 
     constructor(IERC20 token0_, IERC20 token1_, string memory name, string memory symbol) ERC20(name, symbol) {
         if (address(token0_) == address(0) || address(token1_) == address(0)) revert Pool__ZeroAddress();
@@ -162,5 +171,39 @@ contract SimplePool is ERC20, ReentrancyGuard {
                 currentPrice1 += Math.mulDiv(reserve0, Q112, reserve1) * elapsed;
             }
         }
+    }
+
+    function maxFlashLoan(address token) public view returns (uint256) {
+        if (token == address(token0)) return reserve0;
+        else if (token == address(token1)) return reserve1;
+        return 0;
+    }
+
+    function flashFee(address token, uint256 amount) public view returns (uint256) {
+        if (token != address(token0) && token != address(token1)) revert Pool__InvalidToken(token);
+        return Math.mulDiv(amount, FLASH_FEE_BPS, 10_000, Math.Rounding.Ceil);
+    }
+
+    function flashLoan(IERC3156FlashBorrower receiver, address token, uint256 amount, bytes calldata data)
+        external
+        nonReentrant
+        returns (bool)
+    {
+        _accumulate();
+        uint256 fee = flashFee(token, amount); // reverts for any other token
+        if (amount == 0) revert Pool__ZeroAmount();
+        uint256 maxLoan = maxFlashLoan(token);
+        if (amount > maxLoan) revert Pool__FlashLoanTooLarge(amount, maxLoan);
+
+        SafeERC20.safeTransfer(IERC20(token), address(receiver), amount);
+        bytes32 success = receiver.onFlashLoan(msg.sender, token, amount, fee, data);
+        if (success != CALLBACK_SUCCESS) revert Pool__CallbackFailed();
+
+        if (token == address(token0)) reserve0 += fee;
+        else reserve1 += fee;
+        _checkReserves();
+        SafeERC20.safeTransferFrom(IERC20(token), address(receiver), address(this), amount + fee);
+        emit FlashLoan(msg.sender, address(receiver), token, amount, fee);
+        return true;
     }
 }
